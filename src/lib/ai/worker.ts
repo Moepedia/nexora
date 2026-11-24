@@ -1,6 +1,11 @@
+
 import { env, pipeline } from '@huggingface/transformers';
 
-type ChatMessage = { role: 'user' | 'assistant'; content: string };
+type ChatMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+};
+
 type WorkerRequest =
   | { type: 'generate'; messages: ChatMessage[] }
   | { type: 'reset' };
@@ -11,10 +16,20 @@ type WorkerResponse =
   | { type: 'response'; text: string }
   | { type: 'error'; message: string };
 
-type TextGenerator = (prompt: string, options: Record<string, unknown>) => Promise<Array<{ generated_text?: string | Array<{ role?: string; content?: string }> }>>;
+type TextGenerator = (
+  prompt: string,
+  options: Record<string, unknown>
+) => Promise<Array<{
+  generated_text?: string | Array<{
+    role?: string;
+    content?: string;
+  }>;
+}>>;
 
 const MODEL_ID = 'onnx-community/Qwen2.5-0.5B-Instruct';
+
 let generatorPromise: Promise<TextGenerator> | null = null;
+let isGenerating = false;
 
 function post(message: WorkerResponse) {
   self.postMessage(message);
@@ -27,34 +42,84 @@ async function loadModel(): Promise<TextGenerator> {
     env.allowLocalModels = false;
     env.useBrowserCache = true;
 
-    const onProgress = (event: { status?: string; progress?: number; file?: string }) => {
+    // Optimasi penggunaan RAM WASM.
+    env.backends.onnx.wasm.numThreads = 1;
+
+    const isAndroid = /Android/i.test(navigator.userAgent);
+
+    const onProgress = (event: {
+      progress?: number;
+      file?: string;
+    }) => {
       if (typeof event.progress === 'number') {
-        post({ type: 'progress', progress: Math.max(0, Math.min(100, event.progress)), file: event.file });
+        post({
+          type: 'progress',
+          progress: Math.max(0, Math.min(100, event.progress)),
+          file: event.file,
+        });
       }
     };
 
-    post({ type: 'status', status: 'loading', message: 'Menyiapkan model AI…' });
+    post({
+      type: 'status',
+      status: 'loading',
+      message: 'Menyiapkan model AI...',
+    });
 
-    // Prefer WebGPU, then fall back to WASM for browsers without working WebGPU.
-    if ('gpu' in navigator) {
-      try {
-        const gpuPipeline = await pipeline('text-generation', MODEL_ID, {
-          device: 'webgpu',
-          dtype: 'q4',
-          progress_callback: onProgress,
-        });
-        return gpuPipeline as unknown as TextGenerator;
-      } catch (gpuError) {
-        console.warn('NEXORA: WebGPU unavailable, falling back to WASM.', gpuError);
+    const gpu = (
+      navigator as Navigator & {
+        gpu?: {
+          requestAdapter: () => Promise<unknown | null>;
+        };
+      }
+    ).gpu;
+
+    // Periksa WebGPU sebelum mengunduh dan memuat model.
+    if (gpu) {
+      const adapter = await gpu.requestAdapter();
+
+      if (adapter) {
+        try {
+          const model = await pipeline(
+            'text-generation',
+            MODEL_ID,
+            {
+              device: 'webgpu',
+              dtype: 'q4',
+              progress_callback: onProgress,
+            }
+          );
+
+          return model as unknown as TextGenerator;
+        } catch (error) {
+          console.error('NEXORA WebGPU error:', error);
+
+          // Hindari percobaan kedua yang berpotensi
+          // memperparah tekanan memori Android.
+          if (isAndroid) {
+            throw new Error(
+              'WebGPU gagal memuat model. Silakan muat ulang halaman dan coba kembali.'
+            );
+          }
+
+          console.warn('Mencoba fallback WASM...');
+        }
       }
     }
 
-    const wasmPipeline = await pipeline('text-generation', MODEL_ID, {
-      device: 'wasm',
-      dtype: 'q4',
-      progress_callback: onProgress,
-    });
-    return wasmPipeline as unknown as TextGenerator;
+    // WASM hanya digunakan jika WebGPU tidak tersedia
+    // atau adapter tidak dapat ditemukan.
+    const wasmModel = await pipeline(
+      'text-generation',
+      MODEL_ID,
+      {
+        device: 'wasm',
+        dtype: 'q4',
+        progress_callback: onProgress,
+      }
+    );
+
+    return wasmModel as unknown as TextGenerator;
   })().catch((error) => {
     generatorPromise = null;
     throw error;
@@ -66,55 +131,117 @@ async function loadModel(): Promise<TextGenerator> {
 function makePrompt(messages: ChatMessage[]) {
   const system = [
     'You are NEXORA AI, a helpful, honest, and thoughtful assistant.',
-    'Reply in the same language as the user. If the user writes Indonesian, respond in natural Indonesian.',
-    'If you are unsure, say so. Do not invent sources, facts, or actions.',
-    'Use clear formatting and concise explanations unless more detail is requested.',
+    'Reply in the same language as the user.',
+    'If the user writes Indonesian, respond in natural Indonesian.',
+    'If unsure, say so. Do not invent facts.',
+    'Use clear formatting and concise explanations.',
   ].join(' ');
 
-  const recentMessages = messages.slice(-8);
+  const recentMessages = messages.slice(-6);
+
   return [
     `<|im_start|>system\n${system}<|im_end|>`,
-    ...recentMessages.map((message) => `<|im_start|>${message.role}\n${message.content}<|im_end|>`),
+    ...recentMessages.map(
+      (message) =>
+        `<|im_start|>${message.role}\n${message.content}<|im_end|>`
+    ),
     '<|im_start|>assistant\n',
   ].join('\n');
 }
 
-function getGeneratedText(result: Array<{ generated_text?: string | Array<{ role?: string; content?: string }> }>, prompt: string) {
+function getGeneratedText(
+  result: Array<{
+    generated_text?: string | Array<{
+      role?: string;
+      content?: string;
+    }>;
+  }>,
+  prompt: string
+) {
   const generated = result?.[0]?.generated_text;
+
   if (typeof generated === 'string') {
-    return generated.startsWith(prompt) ? generated.slice(prompt.length).trim() : generated.trim();
+    return generated.startsWith(prompt)
+      ? generated.slice(prompt.length).trim()
+      : generated.trim();
   }
+
   if (Array.isArray(generated)) {
-    const lastAssistant = [...generated].reverse().find((item) => item.role === 'assistant');
+    const lastAssistant = [...generated]
+      .reverse()
+      .find((item) => item.role === 'assistant');
+
     return lastAssistant?.content?.trim() ?? '';
   }
+
   return '';
 }
 
-self.addEventListener('message', async (event: MessageEvent<WorkerRequest>) => {
-  const request = event.data;
-  if (request.type === 'reset') {
-    generatorPromise = null;
-    return;
-  }
+self.addEventListener(
+  'message',
+  async (event: MessageEvent<WorkerRequest>) => {
+    const request = event.data;
 
-  try {
-    const generator = await loadModel();
-    post({ type: 'status', status: 'generating', message: 'NEXORA sedang berpikir…' });
-    const prompt = makePrompt(request.messages);
-    const result = await generator(prompt, {
-      max_new_tokens: 256,
-      temperature: 0.7,
-      do_sample: true,
-      repetition_penalty: 1.08,
-      return_full_text: false,
-    });
-    const text = getGeneratedText(result, prompt);
-    if (!text) throw new Error('Model tidak menghasilkan jawaban. Coba kirim pesan lain.');
-    post({ type: 'response', text });
-    post({ type: 'status', status: 'ready', message: 'Model siap' });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : 'Terjadi kesalahan saat menjalankan model.';
-    post({ type: 'error', message });
+    if (request.type === 'reset') {
+      if (!isGenerating) {
+        generatorPromise = null;
+      }
+      return;
+    }
+
+    if (isGenerating) return;
+
+    isGenerating = true;
+
+    try {
+      const generator = await loadModel();
+
+      post({
+        type: 'status',
+        status: 'generating',
+        message: 'NEXORA sedang berpikir...',
+      });
+
+      const prompt = makePrompt(request.messages);
+
+      const result = await generator(prompt, {
+        max_new_tokens: 128,
+        temperature: 0.7,
+        do_sample: true,
+        repetition_penalty: 1.08,
+        return_full_text: false,
+      });
+
+      const text = getGeneratedText(result, prompt);
+
+      if (!text) {
+        throw new Error(
+          'Model tidak menghasilkan jawaban. Coba kirim pesan lain.'
+        );
+      }
+
+      post({
+        type: 'response',
+        text,
+      });
+
+      post({
+        type: 'status',
+        status: 'ready',
+        message: 'Model siap',
+      });
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'Terjadi kesalahan saat menjalankan model.';
+
+      post({
+        type: 'error',
+        message,
+      });
+    } finally {
+      isGenerating = false;
+    }
   }
-});
+);
