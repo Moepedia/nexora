@@ -1,20 +1,14 @@
-# NEXORA AI — Stage 1 Starter
+# NEXORA AI — Stage 2
 
-A public, local-first AI web app foundation built with Next.js App Router.
+Public, browser-first AI chat starter. The language model runs on each visitor's device; Vercel hosts the web app and does not run inference.
 
-## Current stage
-
-- Responsive desktop and mobile chat interface
-- Guest-first entry point; sign-in is an optional placeholder
-- New conversation and conversation switching
-- Local conversation persistence using browser localStorage
-- Starter prompt cards
-- Clear preview notice: no AI model is connected yet
-
-## Requirements
-
-- Node.js 20.9 or newer
-- npm
+## Stack
+- Next.js 15.5.29
+- React 19
+- Transformers.js 3.8.1
+- `onnx-community/Qwen2.5-0.5B-Instruct` (Apache-2.0 model card)
+- WebGPU preferred, WASM fallback
+- Browser cache for model assets; localStorage for conversation history
 
 ## Run locally
 
@@ -25,33 +19,28 @@ npm run dev
 
 Open http://localhost:3000.
 
-## Build check
+## Build
 
 ```bash
 npm run build
 ```
 
+## Model behavior
+- The model is loaded in a Web Worker after the first message, not during initial page load.
+- The first model download is large (hundreds of MB; exact assets depend on runtime and quantization). It requires an internet connection.
+- The browser attempts WebGPU first and falls back to WASM if WebGPU initialization fails.
+- Subsequent visits may reuse browser cache. Browser storage can be cleared or evicted, so caching is not guaranteed forever.
+- Inference runs locally. Prompts are sent to the model files host only as asset downloads; chat prompts are not sent to a hosted inference API.
+- Performance and compatibility vary by device/browser. Low-memory phones may fail to load this model.
+
+## Current scope
+Implemented: local model inference, chat history in localStorage, guest access.
+Not implemented yet: accounts/sync, durable memory, web search, file parsing, code execution, abuse prevention and advanced model selection.
+
 ## Deploy to Vercel
+1. Commit and push this project to GitHub.
+2. Import the repository in Vercel as a Next.js project.
+3. Deploy with the default build command (`npm run build`).
+4. Test the deployed site in a WebGPU-capable browser and a WASM fallback browser.
 
-1. Push this project to a GitHub repository.
-2. Import the repository at https://vercel.com/new.
-3. Keep the framework preset as Next.js.
-4. Deploy. No environment variables are needed for this UI-only stage.
-
-## Important architecture notes
-
-- This stage is the UI and local conversation foundation only. It does not generate AI answers yet.
-- Conversations are stored in the current browser's localStorage. They do not sync between devices and can be lost if browser site data is cleared.
-- The AI engine will be added in Stage 2 using an in-browser open model runtime. Model files should be fetched from a model host/CDN rather than bundled into the Vercel deployment.
-- Optional accounts and cross-device sync are planned for a later stage. A hosted database/auth provider may have free-tier limits.
-- Public web search cannot be guaranteed unlimited and free. We will keep it as a replaceable adapter and evaluate providers before enabling it.
-
-## Project structure
-
-```text
-src/
-  app/
-    globals.css
-    layout.tsx
-    page.tsx
-```
+The Vercel deployment serves static/app assets only. Each visitor downloads model assets and performs inference on their own device.
